@@ -6,7 +6,6 @@ Every operation is one ``/bin/sh`` line run over SSH as the box's user, ``agent`
 from __future__ import annotations
 
 import re
-import shlex
 from dataclasses import dataclass
 
 SH = "/bin/sh"
@@ -18,7 +17,7 @@ SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 KILL_AFTER = 5
 """Seconds between the TERM and the KILL a timed-out command gets."""
 
-_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # cd to $0, then run "$@": neither the directory nor the arguments go through word splitting.
 _CD_AND_RUN = 'cd -- "$0" && exec "$@"'
@@ -48,7 +47,7 @@ class Compose:
 
 def check_env(env: dict[str, str] | None) -> None:
     for name in env or {}:
-        if not _ENV_NAME.fullmatch(name):
+        if not ENV_NAME.fullmatch(name):
             raise ValueError(f"{name!r} isn't an environment variable name")
 
 
@@ -68,9 +67,10 @@ def exec_argv(
 ) -> list[str]:
     """The argv that runs ``cmd`` as Inspect asks.
 
-    In the box: ``timeout`` (which signals the command's whole process group), then ``sudo`` for another user, then a
-    shell that changes to ``cwd`` as that user and ``exec``s ``cmd``; ``env`` goes through ``env`` so it survives
-    ``sudo``. In a compose service: ``docker compose exec`` with the same ``timeout`` inside the container.
+    In the box: ``sudo`` for another user, then ``timeout`` as that user (so its TERM and KILL reach the command and
+    its children, which ``agent`` couldn't signal), then a shell that changes to ``cwd`` and ``exec``s ``cmd``.
+    ``env`` goes through ``env``, so it survives ``sudo``. In a compose service: ``docker compose exec``, with the
+    same ``timeout`` inside the container.
     """
     if not cmd:
         raise ValueError("cmd must not be empty")
@@ -88,7 +88,7 @@ def exec_argv(
         run += [ENV, *(f"{name}={value}" for name, value in env.items())]
     run += cmd
     if user is not None:
-        return [*limit, SUDO, "-n", "-H", "-u", sudo_user(user), "--", *run]
+        return [SUDO, "-n", "-H", "-u", sudo_user(user), "--", *limit, *run]
     return [*limit, *run]
 
 
@@ -106,16 +106,6 @@ def script_argv(script: str, *args: str, user: str | None, compose: Compose | No
     if user is not None:
         return [SUDO, "-n", "-H", "-u", sudo_user(user), "--", *inner]
     return inner
-
-
-def line(argv: list[str], *, stdin: str | None = None, remove: list[str] | None = None) -> str:
-    """One shell line: ``argv``, with stdin from a file if given, then the temp files removed. Keeps argv's status."""
-    out = shlex.join(argv)
-    if stdin is not None:
-        out += f" < {shlex.quote(stdin)}"
-    if remove:
-        out += f"; rc=$?; /bin/rm -f -- {shlex.join(remove)}; exit $rc"
-    return out
 
 
 READ = """\

@@ -16,6 +16,18 @@ import yaml
 from inspect_ai.util import ComposeConfig, is_dockerfile, parse_compose_yaml
 
 GENERATED = ".orble-inspect-compose.yaml"
+SKIPPED = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache", ".mypy_cache"}
+"""Directories never sent to the box: version control, virtualenvs and caches. A ``logs`` directory next to the compose
+file is left out too: Inspect writes its logs there as the eval runs, which would make every sample pack the project
+again."""
+
+
+def _skipped(name: str) -> bool:
+    """A path part that stays on this machine: a skipped directory, or a ``.env`` file (Inspect reads API keys from it,
+    and an untrusted model shouldn't find them in its box)."""
+    return name in SKIPPED or name == ".env" or name.startswith(".env.")
+
+
 MAX_BYTES = 512 * 1024 * 1024
 
 DOCKERFILE_COMPOSE = """\
@@ -38,6 +50,8 @@ class Source:
 
     archive: bytes
     file: str
+    text: str
+    """The compose file, to see which ``SAMPLE_METADATA_*`` variables it uses."""
     services: list[str]
     default_service: str
 
@@ -77,9 +91,10 @@ def _from_file(path: Path) -> Source:
         config = ComposeConfig.model_validate(yaml.safe_load(text))
         file = GENERATED
     else:
+        text = path.read_text()
         config = parse_compose_yaml(str(path), multiple_services=True)
         file = path.name
-    return Source(_pack(path.parent, extra), file, list(config.services), default_service(config))
+    return Source(_pack(path.parent, extra), file, text, list(config.services), default_service(config))
 
 
 def _from_config(config: ComposeConfig) -> Source:
@@ -87,7 +102,8 @@ def _from_config(config: ComposeConfig) -> Source:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
         _add(tar, GENERATED, text.encode())
-    return Source(buffer.getvalue(), GENERATED, list(config.services), default_service(config))
+    # Inspect resolves a ComposeConfig before it gets here, so it takes no metadata variables.
+    return Source(buffer.getvalue(), GENERATED, "", list(config.services), default_service(config))
 
 
 def _pack(directory: Path, extra: dict[str, bytes]) -> bytes:
@@ -106,8 +122,9 @@ def _pack(directory: Path, extra: dict[str, bytes]) -> bytes:
 
 
 def _owned(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
-    """Every entry owned by the box's user; no devices or version-control data."""
-    if info.isdev() or "/.git/" in f"/{info.name}/":
+    """Every entry owned by the box's user; no devices, and nothing ``_skipped``."""
+    parts = [p for p in info.name.split("/") if p not in ("", ".")]
+    if info.isdev() or any(_skipped(part) for part in parts) or parts[:1] == ["logs"]:
         return None
     info.uid = info.gid = 1000
     info.uname = info.gname = "agent"
@@ -125,8 +142,10 @@ def _newest(directory: Path) -> float:
     """The newest change in a directory tree, so an edited build context is packed again."""
     newest = directory.stat().st_mtime
     for root, dirs, files in os.walk(directory):
-        dirs[:] = [d for d in dirs if d != ".git"]
+        dirs[:] = [d for d in dirs if not _skipped(d) and not (root == str(directory) and d == "logs")]
         for name in files:
+            if _skipped(name):
+                continue
             try:
                 newest = max(newest, os.stat(os.path.join(root, name)).st_mtime)
             except OSError:

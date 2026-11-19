@@ -13,6 +13,7 @@ import shlex
 import sys
 import time
 import uuid
+import weakref
 from contextvars import ContextVar
 from typing import Any, Literal, overload
 
@@ -39,7 +40,7 @@ from . import _commands as cmds
 from ._api import Api, OrbleError, api_key, api_url
 from ._compose import compose_source
 from ._config import OrbleSandboxEnvironmentConfig, resolve_config
-from ._ssh import connect
+from ._ssh import TunnelError, connect
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,8 @@ MAX_LINE = 64 * 1024
 SLACK = 15
 """Seconds an exec may run beyond its own timeout and the KILL grace before the connection gives up on it."""
 CLEANUP_PREFIX_ENV = "ORBLE_INSPECT_PREFIX"
+CHANNELS = 8
+"""Commands at once on one box's SSH connection: sshd allows 10 sessions per connection by default."""
 
 _now = time.monotonic
 
@@ -91,15 +94,17 @@ def _run() -> _Run:
     return run_
 
 
-# One API client per event loop: an httpx client can't outlive the loop it was made on.
-_apis: dict[int, Api] = {}
+# One API client per event loop: an httpx client can't outlive the loop it was made on, and a dead loop's id can be
+# reused by the next one, so the map holds the loops weakly.
+_apis: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Api] = weakref.WeakKeyDictionary()
 
 
 def _api() -> Api:
-    loop = id(asyncio.get_running_loop())
-    if loop not in _apis:
-        _apis[loop] = Api()
-    return _apis[loop]
+    loop = asyncio.get_running_loop()
+    api = _apis.get(loop)
+    if api is None:
+        api = _apis[loop] = Api()
+    return api
 
 
 # SSH keys this process added to the account, removed at exit if an eval didn't get to it.
@@ -149,12 +154,37 @@ class _Output:
 
 
 class _Box:
-    """A box and its SSH connection, shared by the compose services in it."""
+    """A box and its SSH connection, shared by the compose services in it. A dropped connection is made again."""
 
-    def __init__(self, name: str, hostname: str, conn: asyncssh.SSHClientConnection) -> None:
+    def __init__(
+        self, name: str, hostname: str, host_key: str, key: asyncssh.SSHKey, conn: asyncssh.SSHClientConnection
+    ) -> None:
         self.name = name
         self.hostname = hostname
+        self.host_key = host_key
+        self.key = key
         self.conn = conn
+        self.channels = asyncio.Semaphore(CHANNELS)
+        self._reconnect = asyncio.Lock()
+
+    async def _process(self, line: str) -> asyncssh.SSHClientProcess[bytes]:
+        """Start ``line``; if the connection has dropped, connect again once."""
+        conn = self.conn
+        try:
+            return await conn.create_process(line, encoding=None)
+        except (asyncssh.Error, OSError):
+            async with self._reconnect:
+                if self.conn is conn:  # nobody reconnected meanwhile
+                    old, api = self.conn, _api()
+                    try:
+                        self.conn = await connect(api.url, api.key, self.hostname, self.host_key, self.key)
+                    except (OSError, asyncssh.Error, TimeoutError, TunnelError) as error:
+                        raise SandboxUnavailableError(f"Orble box {self.name} isn't reachable: {error}") from error
+                    _close_conn(old)
+            try:
+                return await self.conn.create_process(line, encoding=None)
+            except (asyncssh.Error, OSError) as error:
+                raise SandboxUnavailableError(f"Orble box {self.name} isn't reachable: {error}") from error
 
     async def run(self, line: str, *, stdin: bytes | None, timeout: float | None, limit: int) -> _Output:
         """Run a shell line; ``stdin`` is streamed in, output streams back up to ``limit`` bytes per stream."""
@@ -164,11 +194,12 @@ class _Box:
             if wrote.exit_code != 0:
                 raise RuntimeError(f"Couldn't send a long command to box {self.name}: {bytes(wrote.stderr)!r}")
             line = f"/bin/sh {script}; rc=$?; /bin/rm -f -- {script}; exit $rc"
+        async with self.channels:
+            return await self._run(line, stdin=stdin, timeout=timeout, limit=limit)
+
+    async def _run(self, line: str, *, stdin: bytes | None, timeout: float | None, limit: int) -> _Output:
         out = _Output()
-        try:
-            process = await self.conn.create_process(line, encoding=None)
-        except (asyncssh.Error, OSError) as error:
-            raise SandboxUnavailableError(f"Orble box {self.name} isn't reachable: {error}") from error
+        process = await self._process(line)
 
         async def feed() -> None:
             try:
@@ -205,12 +236,17 @@ class _Box:
         return out
 
     async def close(self) -> None:
-        with contextlib.suppress(Exception):
+        with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
             self.conn.close()
             await asyncio.wait_for(self.conn.wait_closed(), 5)
-        relay = getattr(self.conn, "_orble_relay", None)
-        if relay is not None:
-            relay.cancel()
+        _close_conn(self.conn)
+
+
+def _close_conn(conn: asyncssh.SSHClientConnection) -> None:
+    conn.close()
+    relay = getattr(conn, "_orble_relay", None)
+    if relay is not None:
+        relay.cancel()
 
 
 @sandboxenv(name="orble")
@@ -340,7 +376,9 @@ class OrbleSandboxEnvironment(SandboxEnvironment):
     @override
     @classmethod
     def config_deserialize(cls, config: dict[str, Any]) -> BaseModel:
-        return OrbleSandboxEnvironmentConfig.model_validate(config)
+        resolved = OrbleSandboxEnvironmentConfig.model_validate(config)
+        resolved.check()
+        return resolved
 
     @override
     @classmethod
@@ -349,14 +387,14 @@ class OrbleSandboxEnvironment(SandboxEnvironment):
         resolved, compose = resolve_config(config)
         if compose is not None:
             await anyio.to_thread.run_sync(compose_source, compose)
-        run = _run()
-        run.tasks += 1
         api = _api()
         await api.call("GET", "/v1/me")
         if resolved.snapshot:
-            names = {s.get("name") for s in await api.snapshots()} | {s.get("alias") for s in await api.snapshots()}
+            snapshots = await api.snapshots()
+            names = {s.get("name") for s in snapshots} | {s.get("alias") for s in snapshots}
             if resolved.snapshot not in names:
                 raise ValueError(f"No snapshot {resolved.snapshot!r} in this Orble account (orble snapshots)")
+        _run().tasks += 1  # counted once the task is sure to start, so task_cleanup's count matches
 
     @override
     @classmethod
@@ -368,25 +406,32 @@ class OrbleSandboxEnvironment(SandboxEnvironment):
         api = _api()
         key = await _key(run)
         name = f"{resolved.name_prefix}-{run.id}{uuid.uuid4().hex[:6]}"
-        with anyio.CancelScope(shield=True):  # a box made while the sample is cancelled is still recorded
-            info = await api.create_box(name, resolved.size, resolved.snapshot)
-            run.boxes.add(name)
+        # Recorded before the request: a box the server made while the answer was lost still gets deleted. Shielded:
+        # a box made while the sample is cancelled is deleted too.
+        run.boxes.add(name)
+        with anyio.CancelScope(shield=True):
+            try:
+                info = await api.create_box(name, resolved.size, resolved.snapshot)
+            except BaseException:
+                await _delete(name)
+                raise
         trace_message(logger, "orble", f"Created box {name} ({info.get('name')})")
         box: _Box | None = None
         try:
             with contextlib.suppress(OrbleError):  # older servers have no keep-awake; an SSH session keeps it up
                 await api.keep_awake(name)
             if resolved.delete_after:
-                _backstop(api, name, resolved.delete_after)
+                _backstop(api, run, name, resolved.delete_after)
             box = await _connect(api, name, info, key)
             await _prepare(box, resolved, on_box=compose is None)
             if compose is None:
                 return {"default": OrbleSandboxEnvironment(box, resolved.working_dir or HOME)}
-            return await _compose_environments(box, resolved, compose)
+            return await _compose_environments(box, resolved, compose, metadata)
         except BaseException:
-            if box is not None:
-                await box.close()
-            await _delete(name)
+            with anyio.CancelScope(shield=True):
+                if box is not None:
+                    await box.close()
+                await _delete(name)
             raise
 
     @override
@@ -425,45 +470,68 @@ class OrbleSandboxEnvironment(SandboxEnvironment):
     @override
     @classmethod
     async def cli_cleanup(cls, id: str | None) -> None:
-        """``inspect sandbox cleanup orble [box]``: one box, or every box named ``inspect-...``."""
+        """``inspect sandbox cleanup orble [box]``: one box, or every box named ``inspect-...``.
+
+        Only boxes whose names start with the prefix (``ORBLE_INSPECT_PREFIX``, default ``inspect``) are touched. A
+        box of an eval that's still running is deleted too, after a prompt at a terminal. SSH keys an eval added
+        are removed once no box carries that eval's id.
+        """
         api = Api()
+        prefix = (os.environ.get(CLEANUP_PREFIX_ENV) or "inspect") + "-"
         try:
             if id is not None:
-                if await api.box(id) is None:
+                box = await api.box(id)
+                if box is None:
                     print(f"No Orble box {id}.")
+                    sys.exit(1)
+                if not (box.get("alias") or box.get("name") or "").startswith(prefix):
+                    print(f"{id} wasn't made by orble-inspect (its name doesn't start with {prefix}): kept.")
                     sys.exit(1)
                 await api.delete_box(id)
                 print(f"Deleted Orble box {id}")
                 return
-            prefix = (os.environ.get(CLEANUP_PREFIX_ENV) or "inspect") + "-"
-            boxes = [b for b in await api.boxes() if (b.get("alias") or b.get("name") or "").startswith(prefix)]
-            if not boxes:
+            every = await api.boxes()
+            boxes = [b for b in every if (b.get("alias") or b.get("name") or "").startswith(prefix)]
+            if boxes:
+                for b in boxes:
+                    print(f"{b.get('alias')}  {b.get('name')}  {b.get('state')}")
+                interactive = sys.stdin.isatty() and "CI" not in os.environ
+                if interactive and input(f"Delete {len(boxes)} box(es)? [y/N] ").strip().lower() not in ("y", "yes"):
+                    print("Cancelled.")
+                    return
+                failed = 0
+                for b in boxes:
+                    try:
+                        await api.delete_box(b.get("alias") or b["name"])
+                    except OrbleError as error:
+                        failed += 1
+                        print(f"Couldn't delete {b.get('alias')}: {error}")
+                print(f"Deleted {len(boxes) - failed} box(es).")
+                every = await api.boxes()
+            else:
                 print(f"No Orble boxes named {prefix}...")
-                # With no eval's boxes left, no eval is running: the SSH keys evals added are leftovers of killed ones.
-                for key in await api.keys():
-                    if str(key.get("name", "")).startswith("orble-inspect-"):
-                        await api.remove_key(key["fingerprint"])
-                        print(f"Removed SSH key {key['name']}")
-                return
-            for b in boxes:
-                print(f"{b.get('alias')}  {b.get('name')}  {b.get('state')}")
-            interactive = sys.stdin.isatty() and "CI" not in os.environ
-            if interactive and input(f"Delete {len(boxes)} box(es)? [y/N] ").strip().lower() not in ("y", "yes"):
-                print("Cancelled.")
-                return
-            for b in boxes:
-                await api.delete_box(b.get("alias") or b["name"])
-            print(f"Deleted {len(boxes)} box(es).")
+            # A key named orble-inspect-<run id> belongs to an eval; with no box of that run left (box names carry
+            # the run id, whatever their prefix), the eval was killed before it could remove its key.
+            names = " ".join(str(b.get("alias") or "") + " " + str(b.get("name") or "") for b in every)
+            for key in await api.keys():
+                key_name = str(key.get("name", ""))
+                if key_name.startswith("orble-inspect-") and key_name.removeprefix("orble-inspect-") not in names:
+                    await api.remove_key(key["fingerprint"])
+                    print(f"Removed SSH key {key_name}")
         finally:
             await api.aclose()
 
 
-def _backstop(api: Api, name: str, seconds: int) -> None:
+def _backstop(api: Api, run: _Run, name: str, seconds: int) -> None:
     """A command in the box that deletes it after ``seconds``, whatever happens to this process."""
 
     async def go() -> None:
-        with contextlib.suppress(Exception):
+        try:
             await api.exec_then_delete(name, f"exec sleep {int(seconds)}")
+        except (OrbleError, httpx.HTTPError) as error:
+            # A read timeout is the call outliving its 50 s; an error once the box is deleted is the deletion ending it.
+            if not isinstance(error, httpx.ReadTimeout) and name in run.boxes and name not in _deleting:
+                logger.warning(f"Couldn't set the delete_after backstop on Orble box {name}: {error}")
 
     task = asyncio.ensure_future(go())
     _backstops.add(task)
@@ -486,7 +554,12 @@ async def _connect(api: Api, name: str, info: dict[str, Any], key: asyncssh.SSHK
                 continue
         try:
             conn = await connect(api.url, api.key, hostname, host_key, key)
-            return _Box(name, hostname, conn)
+            return _Box(name, hostname, host_key, key, conn)
+        except TunnelError as error:
+            if error.status in (400, 401, 403, 404):  # refused for good (rare: the route answers any box): don't wait
+                raise SandboxUnavailableError(f"Orble refused SSH to box {name}: {error}") from error
+            last = error
+            await asyncio.sleep(1)
         except (OSError, asyncssh.Error, TimeoutError, asyncio.IncompleteReadError) as error:
             last = error  # sshd still starting, or the key not yet in the box
             await asyncio.sleep(1)
@@ -511,9 +584,13 @@ async def _prepare(box: _Box, config: OrbleSandboxEnvironmentConfig, on_box: boo
 
 
 async def _compose_environments(
-    box: _Box, config: OrbleSandboxEnvironmentConfig, compose: str | ComposeConfig
+    box: _Box, config: OrbleSandboxEnvironmentConfig, compose: str | ComposeConfig, metadata: dict[str, str]
 ) -> dict[str, SandboxEnvironment]:
-    """Unpack the compose project in the box, start it with Docker, and wrap each running service."""
+    """Unpack the compose project in the box, start it with Docker, and wrap each running service.
+
+    As in Inspect's Docker sandbox, each metadata entry the compose file mentions as ``SAMPLE_METADATA_<KEY>`` is set
+    for ``docker compose``, so the file can interpolate it.
+    """
     source = await anyio.to_thread.run_sync(compose_source, compose)
     project = cmds.Compose(COMPOSE_PROJECT, COMPOSE_DIR, f"{COMPOSE_DIR}/{source.file}", "")
     base = shlex.join(project.base())
@@ -525,9 +602,12 @@ async def _compose_environments(
     )
     if unpack.exit_code != 0:
         raise RuntimeError(f"Couldn't unpack the compose project in box {box.name}: {_text(unpack.stderr)}")
+    variables = {f"SAMPLE_METADATA_{key.replace(' ', '_').upper()}": str(value) for key, value in metadata.items()}
+    variables = {k: v for k, v in variables.items() if k in source.text and cmds.ENV_NAME.fullmatch(k)}
+    env = shlex.join([cmds.ENV, *(f"{k}={v}" for k, v in variables.items())]) + " " if variables else ""
     wait = int(config.compose_timeout)
     started = await box.run(
-        f"{base} up --detach --wait --wait-timeout {wait} --quiet-pull 2>&1",
+        f"{env}{base} up --detach --wait --wait-timeout {wait} --quiet-pull 2>&1",
         stdin=None,
         timeout=config.compose_timeout + 60,
         limit=1 << 22,
@@ -562,14 +642,22 @@ async def _compose_environments(
 
 async def _delete(name: str) -> None:
     """Delete a box this process made; a failure only warns. Not cancellable."""
-    with anyio.CancelScope(shield=True):
-        try:
-            await _api().delete_box(name)
-            trace_message(logger, "orble", f"Deleted box {name}")
-        except Exception as error:  # noqa: BLE001  # a failed delete must not fail the eval; the backstop remains
-            logger.warning(f"Couldn't delete Orble box {name}: {error}")
-            return
-    _run().boxes.discard(name)
+    _deleting.add(name)
+    try:
+        with anyio.CancelScope(shield=True):
+            try:
+                await _api().delete_box(name)
+                trace_message(logger, "orble", f"Deleted box {name}")
+            except Exception as error:  # noqa: BLE001  # a failed delete must not fail the eval; the backstop remains
+                logger.warning(f"Couldn't delete Orble box {name}: {error}")
+                return
+        _run().boxes.discard(name)
+    finally:
+        _deleting.discard(name)
+
+
+_deleting: set[str] = set()
+"""Boxes being deleted: their backstop commands end with an error, which isn't worth a warning."""
 
 
 def _signal_number(name: str) -> int:

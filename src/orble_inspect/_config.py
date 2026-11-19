@@ -57,6 +57,8 @@ class OrbleSandboxEnvironmentConfig(BaseModel):
             raise ValueError("working_dir is an absolute path")
         if self.delete_after is not None and self.delete_after < 60:
             raise ValueError("delete_after is at least 60 seconds")
+        if self.compose_timeout < 10:
+            raise ValueError("compose_timeout is at least 10 seconds")
         if self.compose is not None and not (is_compose_yaml(self.compose) or is_dockerfile(self.compose)):
             raise ValueError(f"compose is a compose.yaml or a Dockerfile, not {self.compose!r}")
 

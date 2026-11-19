@@ -47,7 +47,7 @@ sandbox=("orble", OrbleSandboxEnvironmentConfig(size="m", snapshot="my-env"))
 | `compose` | none | a `compose.yaml` or `Dockerfile` to run with Docker in the box |
 | `working_dir` | `/home/agent` | where commands run and relative paths resolve |
 | `name_prefix` | `inspect` | box names are `<prefix>-<random>` |
-| `delete_after` | 6 hours | the box deletes itself after this many seconds, as a backstop |
+| `delete_after` | 6 hours | the box deletes itself after this many seconds, in case the eval is killed |
 | `compose_timeout` | 900 | seconds `docker compose up` may take |
 
 `sandbox=("orble", "settings.json")` reads the same settings from a file.
@@ -56,7 +56,11 @@ sandbox=("orble", OrbleSandboxEnvironmentConfig(size="m", snapshot="my-env"))
 
 `sandbox=("orble", "compose.yaml")` or `("orble", "Dockerfile")` runs it unchanged with Docker inside the box, as
 Inspect's Docker sandbox would; a task that already has a `compose.yaml` next to it works with `sandbox="orble"`.
-Several services share the box.
+Several services share the box. As with Inspect's Docker sandbox, `SAMPLE_METADATA_<KEY>` variables in the compose
+file take the sample's metadata.
+
+The compose file's directory goes to each box as the build context, without `.env` files (where Inspect keeps API
+keys), a `logs` directory beside the compose file, `.git`, virtualenvs and caches.
 
 Every sample gets a fresh box, so Docker builds the image again in each one: 40 to 70 s per sample for a small
 Ubuntu image. Faster: build the Dockerfile into a snapshot once, and start every sample from it. The snapshot's
@@ -81,11 +85,13 @@ Time from asking for a sandbox to its first command, on Orble's staging servers:
 ## How it works
 
 - Each sample creates a box through Orble's API and deletes it when the sample ends. Boxes are kept awake while in
-  use, and each one deletes itself after `delete_after` in case the eval is killed.
+  use, and each one deletes itself after `delete_after` in case the eval is killed. That backstop is a `sleep` in
+  the box, so a model with sudo can end it; `inspect sandbox cleanup orble` catches what it misses.
 - Commands and files go over SSH, tunnelled through Orble's API over HTTPS, so IPv6 isn't needed. Each eval adds a
   fresh SSH key to the account and removes it when it ends.
-- `inspect sandbox cleanup orble` lists and deletes boxes named `inspect-...`, and with none left, removes the SSH
-  keys of evals that were killed; `inspect sandbox cleanup orble <box>` deletes one box.
+- `inspect sandbox cleanup orble` lists and deletes boxes named `inspect-...` (set `ORBLE_INSPECT_PREFIX` for another
+  `name_prefix`), asking first at a terminal, and removes the SSH keys of evals that no longer have boxes.
+  `inspect sandbox cleanup orble <box>` deletes one of those boxes.
 
 ## Tests
 
