@@ -112,8 +112,11 @@ def _remove_keys_at_exit() -> None:
         with contextlib.suppress(Exception):
             from urllib.parse import quote
 
-            httpx.delete(f"{api_url()}/v1/ssh-keys/{quote(fingerprint, safe='')}",
-                         headers={"Authorization": f"Bearer {api_key()}"}, timeout=10)
+            httpx.delete(
+                f"{api_url()}/v1/ssh-keys/{quote(fingerprint, safe='')}",
+                headers={"Authorization": f"Bearer {api_key()}"},
+                timeout=10,
+            )
 
 
 async def _key(run: _Run) -> asyncssh.SSHKey:
@@ -172,7 +175,7 @@ class _Box:
                 if stdin:
                     view = memoryview(stdin)
                     for start in range(0, len(view), 1 << 20):
-                        process.stdin.write(bytes(view[start:start + (1 << 20)]))
+                        process.stdin.write(bytes(view[start : start + (1 << 20)]))
                         await process.stdin.drain()
                 process.stdin.write_eof()
             except (asyncssh.Error, BrokenPipeError, ConnectionError):
@@ -245,16 +248,22 @@ class OrbleSandboxEnvironment(SandboxEnvironment):
     ) -> ExecResult[str]:
         _check_user(user)
         argv = cmds.exec_argv(
-            cmd, cwd=self._path(cwd) if cwd is not None else self._working_dir, env=env, user=user,
-            timeout=timeout, compose=self._compose,
+            cmd,
+            cwd=self._path(cwd) if cwd is not None else self._working_dir,
+            env=env,
+            user=user,
+            timeout=timeout,
+            compose=self._compose,
         )
         stdin = input.encode() if isinstance(input, str) else input
         started = _now()
         limit = SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE
         try:
             result = await self._box.run(
-                shlex.join(argv), stdin=stdin,
-                timeout=None if timeout is None else timeout + cmds.KILL_AFTER + SLACK, limit=limit,
+                shlex.join(argv),
+                stdin=stdin,
+                timeout=None if timeout is None else timeout + cmds.KILL_AFTER + SLACK,
+                limit=limit,
             )
         except TimeoutError as error:
             raise TimeoutError(f"Command timed out after {timeout} seconds") from error
@@ -262,15 +271,16 @@ class OrbleSandboxEnvironment(SandboxEnvironment):
         stdout, stderr = _text(result.stdout), _text(result.stderr)
         # `timeout` ends a command with 124 (TERM) or 137 (KILL); a command can exit so by itself, but not early.
         if timeout is not None and result.exit_code in (124, 137, 143) and elapsed >= timeout:
-            error = TimeoutError(f"Command timed out after {timeout} seconds")
+            timed_out = TimeoutError(f"Command timed out after {timeout} seconds")
             if stdout or stderr:
-                error.truncated_output = stdout + stderr  # type: ignore[attr-defined]
-            raise error
+                timed_out.truncated_output = stdout + stderr  # type: ignore[attr-defined]
+            raise timed_out
         if result.exit_code == 126 and "permission denied" in (stderr + stdout).casefold():
             raise PermissionError(errno.EACCES, f"Permission denied: {(stderr or stdout).strip()}", cmd[0])
         if result.over_limit:
-            raise OutputLimitExceededError(SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE_STR,
-                                           _text(bytes(result.stdout[-4096:])))
+            raise OutputLimitExceededError(
+                SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE_STR, _text(bytes(result.stdout[-4096:]))
+            )
         return ExecResult(success=result.exit_code == 0, returncode=result.exit_code, stdout=stdout, stderr=stderr)
 
     @override
@@ -278,8 +288,9 @@ class OrbleSandboxEnvironment(SandboxEnvironment):
         _check_user(user)
         data = contents.encode() if isinstance(contents, str) else contents
         argv = cmds.script_argv(cmds.WRITE, self._path(file), user=user, compose=self._compose)
-        result = await self._box.run(shlex.join(argv), stdin=data, timeout=FILE_TIMEOUT,
-                                     limit=SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE)
+        result = await self._box.run(
+            shlex.join(argv), stdin=data, timeout=FILE_TIMEOUT, limit=SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE
+        )
         if result.exit_code != 0:
             _raise_file_error(_text(result.stderr), result.exit_code, file, user)
 
@@ -381,8 +392,11 @@ class OrbleSandboxEnvironment(SandboxEnvironment):
     @override
     @classmethod
     async def sample_cleanup(
-        cls, task_name: str, config: SandboxEnvironmentConfigType | None,
-        environments: dict[str, SandboxEnvironment], interrupted: bool,
+        cls,
+        task_name: str,
+        config: SandboxEnvironmentConfigType | None,
+        environments: dict[str, SandboxEnvironment],
+        interrupted: bool,
     ) -> None:
         done: set[str] = set()
         for environment in environments.values():
@@ -433,10 +447,10 @@ class OrbleSandboxEnvironment(SandboxEnvironment):
                 return
             for b in boxes:
                 print(f"{b.get('alias')}  {b.get('name')}  {b.get('state')}")
-            if sys.stdin.isatty() and "CI" not in os.environ:
-                if input(f"Delete {len(boxes)} box(es)? [y/N] ").strip().lower() not in ("y", "yes"):
-                    print("Cancelled.")
-                    return
+            interactive = sys.stdin.isatty() and "CI" not in os.environ
+            if interactive and input(f"Delete {len(boxes)} box(es)? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("Cancelled.")
+                return
             for b in boxes:
                 await api.delete_box(b.get("alias") or b["name"])
             print(f"Deleted {len(boxes)} box(es).")
@@ -473,8 +487,8 @@ async def _connect(api: Api, name: str, info: dict[str, Any], key: asyncssh.SSHK
         try:
             conn = await connect(api.url, api.key, hostname, host_key, key)
             return _Box(name, hostname, conn)
-        except Exception as error:  # sshd starting, or the key not yet in the box
-            last = error
+        except (OSError, asyncssh.Error, TimeoutError, asyncio.IncompleteReadError) as error:
+            last = error  # sshd still starting, or the key not yet in the box
             await asyncio.sleep(1)
     raise SandboxUnavailableError(f"Couldn't reach Orble box {name} over SSH: {last}")
 
@@ -503,27 +517,43 @@ async def _compose_environments(
     source = await anyio.to_thread.run_sync(compose_source, compose)
     project = cmds.Compose(COMPOSE_PROJECT, COMPOSE_DIR, f"{COMPOSE_DIR}/{source.file}", "")
     base = shlex.join(project.base())
-    unpack = await box.run(f"/bin/mkdir -p {COMPOSE_DIR} && /bin/tar -xzf - -C {COMPOSE_DIR}",
-                           stdin=source.archive, timeout=600, limit=1 << 20)
+    unpack = await box.run(
+        f"/bin/mkdir -p {COMPOSE_DIR} && /bin/tar -xzf - -C {COMPOSE_DIR}",
+        stdin=source.archive,
+        timeout=600,
+        limit=1 << 20,
+    )
     if unpack.exit_code != 0:
         raise RuntimeError(f"Couldn't unpack the compose project in box {box.name}: {_text(unpack.stderr)}")
     wait = int(config.compose_timeout)
-    started = await box.run(f"{base} up --detach --wait --wait-timeout {wait} --quiet-pull 2>&1", stdin=None,
-                            timeout=config.compose_timeout + 60, limit=1 << 22)
-    running = await box.run(f"{base} ps --status running --format '{{{{.Service}}}}'", stdin=None, timeout=120,
-                            limit=1 << 20)
+    started = await box.run(
+        f"{base} up --detach --wait --wait-timeout {wait} --quiet-pull 2>&1",
+        stdin=None,
+        timeout=config.compose_timeout + 60,
+        limit=1 << 22,
+    )
+    running = await box.run(
+        f"{base} ps --status running --format '{{{{.Service}}}}'", stdin=None, timeout=120, limit=1 << 20
+    )
     services = set(_text(running.stdout).split())
     if source.default_service not in services:
-        raise RuntimeError(f"The compose service '{source.default_service}' didn't start in Orble box {box.name}.\n"
-                           f"{_text(started.stdout)[-4000:]}")
+        raise RuntimeError(
+            f"The compose service '{source.default_service}' didn't start in Orble box {box.name}.\n"
+            f"{_text(started.stdout)[-4000:]}"
+        )
     environments: dict[str, SandboxEnvironment] = {}
-    for service in [source.default_service] + [s for s in source.services
-                                               if s != source.default_service and s in services]:
+    for service in [source.default_service] + [
+        s for s in source.services if s != source.default_service and s in services
+    ]:
         compose_service = cmds.Compose(project.project, project.directory, project.file, service)
         working_dir = config.working_dir
         if working_dir is None:
-            pwd = await box.run(shlex.join(cmds.script_argv(cmds.PWD, user=None, compose=compose_service)),
-                                stdin=None, timeout=120, limit=1 << 16)
+            pwd = await box.run(
+                shlex.join(cmds.script_argv(cmds.PWD, user=None, compose=compose_service)),
+                stdin=None,
+                timeout=120,
+                limit=1 << 16,
+            )
             printed = _text(pwd.stdout).strip()
             working_dir = printed if pwd.exit_code == 0 and printed else "/"
         environments[service] = OrbleSandboxEnvironment(box, working_dir, compose_service)
@@ -536,7 +566,7 @@ async def _delete(name: str) -> None:
         try:
             await _api().delete_box(name)
             trace_message(logger, "orble", f"Deleted box {name}")
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001  # a failed delete must not fail the eval; the backstop remains
             logger.warning(f"Couldn't delete Orble box {name}: {error}")
             return
     _run().boxes.discard(name)

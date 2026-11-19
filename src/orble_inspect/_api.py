@@ -88,9 +88,7 @@ class Api:
 
     # SSH keys
     async def add_key(self, public_key: str, name: str) -> str:
-        key: dict[str, Any] = await self.call(
-            "POST", "/v1/ssh-keys", {"public_key": public_key, "name": name}
-        )
+        key: dict[str, Any] = await self.call("POST", "/v1/ssh-keys", {"public_key": public_key, "name": name})
         return str(key["fingerprint"])
 
     async def keys(self) -> list[dict[str, Any]]:

@@ -29,10 +29,19 @@ def test_exec_uid():
 def test_exec_compose():
     compose = c.Compose("p", "/d", "/d/compose.yaml", "web")
     argv = c.exec_argv(["ls"], cwd="/app", env={"X": "y"}, user="u", timeout=3, compose=compose)
-    assert argv[:9] == ["docker", "compose", "--project-name", "p", "--project-directory", "/d", "--file",
-                        "/d/compose.yaml", "exec"]
+    assert argv[:9] == [
+        "docker",
+        "compose",
+        "--project-name",
+        "p",
+        "--project-directory",
+        "/d",
+        "--file",
+        "/d/compose.yaml",
+        "exec",
+    ]
     assert argv[-6:] == ["web", "/usr/bin/timeout", "-k", "5s", "3s", "ls"]
-    assert ["--workdir", "/app"] == argv[10:12] and "--user" in argv and "X=y" in argv
+    assert argv[10:12] == ["--workdir", "/app"] and "--user" in argv and "X=y" in argv
 
 
 def test_bad_env_name():
@@ -58,8 +67,13 @@ def test_script_pins_path():
 
 
 def test_config_checks():
-    for bad in ({"size": "xl"}, {"name_prefix": "Bad"}, {"working_dir": "rel"}, {"delete_after": 5},
-                {"compose": "notes.txt"}):
+    for bad in (
+        {"size": "xl"},
+        {"name_prefix": "Bad"},
+        {"working_dir": "rel"},
+        {"delete_after": 5},
+        {"compose": "notes.txt"},
+    ):
         with pytest.raises(ValueError):
             OrbleSandboxEnvironmentConfig(**bad).check()
     resolved, compose = resolve_config(None)

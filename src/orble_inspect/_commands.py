@@ -34,8 +34,16 @@ class Compose:
     service: str
 
     def base(self) -> list[str]:
-        return ["docker", "compose", "--project-name", self.project, "--project-directory", self.directory,
-                "--file", self.file]
+        return [
+            "docker",
+            "compose",
+            "--project-name",
+            self.project,
+            "--project-directory",
+            self.directory,
+            "--file",
+            self.file,
+        ]
 
 
 def check_env(env: dict[str, str] | None) -> None:

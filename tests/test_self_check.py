@@ -10,8 +10,7 @@ import time
 from pathlib import Path
 
 import pytest
-
-from inspect_ai.util._sandbox.self_check import *  # noqa: F403
+from inspect_ai.util._sandbox.self_check import *
 
 from orble_inspect import OrbleSandboxEnvironment, OrbleSandboxEnvironmentConfig
 

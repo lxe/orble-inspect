@@ -23,8 +23,12 @@ def compute():
 def first_line():
     async def score(state: TaskState, target: Target) -> Score:
         lines = state.output.completion.splitlines()
-        return Score(value=CORRECT if lines and lines[0] == target.text else INCORRECT, answer=lines[0] if lines else "",
-                     explanation=f"box {lines[1] if len(lines) > 1 else '?'}")
+        answer = lines[0] if lines else ""
+        return Score(
+            value=CORRECT if answer == target.text else INCORRECT,
+            answer=answer,
+            explanation=f"box {lines[1] if len(lines) > 1 else '?'}",
+        )
 
     return score
 
@@ -32,8 +36,12 @@ def first_line():
 @task
 def smoke():
     return Task(
-        dataset=[Sample(input="6*7", target="42"), Sample(input="2**10", target="1024"),
-                 Sample(input="sum(range(101))", target="5050"), Sample(input="len('orble')", target="5")],
+        dataset=[
+            Sample(input="6*7", target="42"),
+            Sample(input="2**10", target="1024"),
+            Sample(input="sum(range(101))", target="5050"),
+            Sample(input="len('orble')", target="5"),
+        ],
         solver=compute(),
         scorer=first_line(),
         sandbox="orble",

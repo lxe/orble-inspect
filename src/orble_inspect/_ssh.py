@@ -24,12 +24,16 @@ class TunnelError(Exception):
     pass
 
 
-async def _upgrade(api_url: str, token: str, host: str, hello: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+async def _upgrade(
+    api_url: str, token: str, host: str, hello: str
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     url = urlsplit(api_url)
     secure = url.scheme == "https"
     port = url.port or (443 if secure else 80)
     reader, writer = await asyncio.open_connection(
-        url.hostname, port, ssl=ssl.create_default_context() if secure else None,
+        url.hostname,
+        port,
+        ssl=ssl.create_default_context() if secure else None,
         server_hostname=url.hostname if secure else None,
     )
     query = urlencode({"host": host, "port": "22"})
