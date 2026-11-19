@@ -1,7 +1,7 @@
 # orble-inspect
 
 [Inspect AI](https://inspect.aisi.org.uk) sandboxes on [Orble](https://orble.tech) boxes: each sample gets its own
-Firecracker VM, deleted when the sample ends.
+Linux VM, deleted when the sample ends.
 
 ```sh
 pip install orble-inspect
